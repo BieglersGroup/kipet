@@ -22,15 +22,16 @@
 #        r_d = k_d*(Z_sa^{sat}-Z_sa)^d
 #        r_c = k_c*(max(Z_asa-Z_sa^{sat}))^c
 
-from kipet.model.TemplateBuilder import *
-from kipet.sim.PyomoSimulator import *
-from kipet.utils.data_tools import *
+from kipet.library.TemplateBuilder import *
+from kipet.library.PyomoSimulator import *
+from kipet.library.ParameterEstimator import *
+from kipet.library.VarianceEstimator import *
+from kipet.library.data_tools import *
+
 import matplotlib.pyplot as plt
 import numpy as np
 import sys
 import os
-
-
 
 if __name__ == "__main__":
     
@@ -55,9 +56,14 @@ if __name__ == "__main__":
     
     fixed_traj = read_absorption_data_from_txt(traj)
     C = read_absorption_data_from_txt(conc)
-    
-    # create template model 
-    builder = TemplateBuilder()    
+
+    meas_times=sorted(C.index)
+    print(meas_times)
+    # How many measurement times are there
+    nfe_x = len(meas_times)
+    print(nfe_x)# create template model
+
+    builder = TemplateBuilder()
 
     # components
     components = dict()
@@ -180,7 +186,11 @@ if __name__ == "__main__":
     sim = PyomoSimulator(model)
     # defines the discrete points wanted in the concentration profile
     sim.apply_discretization('dae.collocation',nfe=100,ncp=3,scheme='LAGRANGE-RADAU')
-    
+    fe_l = sim.model.time.get_finite_elements()
+    fe_list = [fe_l[i + 1] - fe_l[i] for i in range(0, len(fe_l) - 1)]
+    nfe = len(fe_list)  #: Create a list with the step-size
+    print(nfe)
+    # sys.exit()
     # good initialization
 
     filename_initZ = os.path.join(dataDirectory, 'init_Z.csv')#Use absolute paths
@@ -195,6 +205,13 @@ if __name__ == "__main__":
             
     sim.fix_from_trajectory('Y','Csat',fixed_traj)
     sim.fix_from_trajectory('Y','f',fixed_traj)
+
+    with open("f0.txt", "w") as f:
+        for t in sim.model.time:
+            val = value(sim.model.Y[t, 'f'])
+            f.write('\t' + str(t) + '\t' + str(val) + '\n')
+        f.close()
+
 
     options = {'halt_on_ampl_error' :'yes'}
     results = sim.run_sim('ipopt',

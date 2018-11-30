@@ -6,14 +6,16 @@
 #  Copyright (c) 2016 Eli Lilly.
 #  _________________________________________________________________________
 
-from kipet.model.TemplateBuilder import *
-from kipet.sim.PyomoSimulator import *
-from kipet.utils.data_tools import *
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import sys
-from kipet.utils.fe_factory import *
+from kipet.library.TemplateBuilder import *
+from kipet.library.PyomoSimulator import *
+from kipet.library.ParameterEstimator import *
+from kipet.library.VarianceEstimator import *
+from kipet.library.data_tools import *
+from kipet.library.FESimulator import *
 from pyomo.opt import *
 import pickle
 import os
@@ -118,50 +120,29 @@ if __name__ == "__main__":
     #USER INPUT SECTION - FE Factory
     #=========================================================================
      
-
-    sim = PyomoSimulator(model)
-    mod = sim.model.clone()
+    # call FESimulator
+    # FESimulator re-constructs the current TemplateBuilder into fe_factory syntax
+    # there is no need to call PyomoSimulator any more as FESimulator is a child class 
+    sim = FESimulator(model)
     
     # defines the discrete points wanted in the concentration profile
     sim.apply_discretization('dae.collocation', nfe=50, ncp=3, scheme='LAGRANGE-RADAU')
 
-    #: we now need to explicitly tell the initial conditions and parameter values
-    param_name = "P"
-    param_dict = {}
-    param_dict["P", "k0"] = 49.7796
-    param_dict["P", "k1"] = 8.93156
-    param_dict["P", "k2"] = 1.31765
-    param_dict["P", "k3"] = 0.310870
-    param_dict["P", "k4"] = 3.87809
-
-    ics_ = dict()
-    ics_['Z', 'AH'] = 0.395555
-    ics_['Z', 'B'] = 0.0351202
-    ics_['Z', 'C'] = 0.0
-    ics_['Z', 'BH+'] = 0.0
-    ics_['Z', 'A-'] = 0.0
-    ics_['Z', 'AC-'] = 0.0
-    ics_['Z', 'P'] = 0.0
-    ics_['X', 'V'] = 0.0629418
-
+    #Since the model cannot discriminate inputs from other algebraic elements, we still
+    #need to define the inputs as inputs_sub
     inputs_sub = {}
     inputs_sub['Y'] = [5]
 
-    #: define the values for our simulation
+    #since these are inputs we need to fix this
     for key in sim.model.time.value:
         sim.model.Y[key, 5].set_value(key)
-        sim.model.Y[key, 5].fix()  #if you don't fix this, fe_factory is will not work complain.
+        sim.model.Y[key, 5].fix()
 
-    init = fe_initialize(sim.model, mod,
-                         init_con="init_conditions_c",
-                         param_name=param_name,
-                         param_values=param_dict,
-                         inputs_sub=inputs_sub)
-    
-    init.load_initial_conditions(init_cond=ics_)
-   
-    init.run()
-
+    #this will allow for the fe_factory to run the element by element march forward along 
+    #the elements and also automatically initialize the PyomoSimulator model, allowing
+    #for the use of the run_sim() function as before. We only need to provide the inputs 
+    #to this function as an argument dictionary
+    init = sim.call_fe_factory(inputs_sub)
     #=========================================================================
     #USER INPUT SECTION - SIMULATION
     #=========================================================================
@@ -172,6 +153,7 @@ if __name__ == "__main__":
     results = sim.run_sim('ipopt',
                           tee=True,
                           solver_opts=options)
+
     if with_plots:
         # display concentration results    
         results.Z.plot.line(legend=True)
@@ -181,15 +163,20 @@ if __name__ == "__main__":
         plt.show()
     
         #results.Y[0].plot.line()
-        results.Y[1].plot.line()
-        results.Y[2].plot.line()
-        results.Y[3].plot.line()
-        results.Y[4].plot.line()
+        results.Y[1].plot.line(legend=True)
+        results.Y[2].plot.line(legend=True)
+        results.Y[3].plot.line(legend=True)
+        results.Y[4].plot.line(legend=True)
         plt.xlabel("time (s)")
         plt.ylabel("rxn rates (mol/L*s)")
         plt.title("Rates of rxn")
         plt.show()
 
+        results.X.plot.line(legend=True)
+        plt.xlabel("time (s)")
+        plt.ylabel("Volume (L)")
+        plt.title("total volume")
+        plt.show()
     #D_frame.plot.line(legend=False)
     #plt.show()
     
