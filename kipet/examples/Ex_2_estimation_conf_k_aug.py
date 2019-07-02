@@ -1,4 +1,3 @@
-
 #  _________________________________________________________________________
 #
 #  Kipet: Kinetic parameter estimation toolkit
@@ -77,7 +76,7 @@ if __name__ == "__main__":
     v_estimator = VarianceEstimator(opt_model)
     v_estimator.apply_discretization('dae.collocation',nfe=60,ncp=1,scheme='LAGRANGE-RADAU')
     
-    # It is often requried for larger problems to give the solver some direct instructions
+    # It is often required for larger problems to give the solver some direct instructions
     # These must be given in the form of a dictionary
     options = {}
     # While this problem should solve without changing the deault options, example code is 
@@ -93,7 +92,7 @@ if __name__ == "__main__":
     # Finally we run the variance estimatator using the arguments shown in Seciton 4.3.3
     results_variances = v_estimator.run_opt('ipopt',
                                             tee=True,
-                                            solver_options=options,
+                                            solver_opts=options,
                                             tolerance=1e-5,
                                             max_iter=15,
                                             subset_lambdas=A_set)
@@ -105,8 +104,7 @@ if __name__ == "__main__":
 
     # and the sigmas for the parameter estimation step are now known and fixed
     sigmas = results_variances.sigma_sq
-    
-    
+        
     #=========================================================================
     # USER INPUT SECTION - PARAMETER ESTIMATION 
     #=========================================================================

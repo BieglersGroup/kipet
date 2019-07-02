@@ -6,6 +6,9 @@ import numpy as np
 import matplotlib as cm
 import six
 
+#=============================================================================
+#-----------------------DATA READING AND WRITING TOOLS------------------------
+#=============================================================================
 
 def write_spectral_data_to_csv(filename,dataframe):
     """ Write spectral data Dij to csv file.
@@ -105,7 +108,7 @@ def write_concentration_data_to_txt(filename,dataframe):
 
 
 def read_concentration_data_from_txt(filename):
-    """ Reads txt with concnetration data
+    """ Reads txt with concentration data
     
         Args:
             filename (str): name of input file
@@ -155,18 +158,40 @@ def read_concentration_data_from_csv(filename):
     data.columns = [n for n in data.columns]
     return data    
 
-def read_spectral_data_from_csv(filename):
+def read_spectral_data_from_csv(filename, instrument = False, negatives_to_zero = False):
     """ Reads csv with spectral data
     
         Args:
             filename (str): name of input file
-         
+            instrument (bool): if data is direct from instrument
+            negatives_to_zero (bool): if data contains negatives and baseline shift is not
+                                        done then this forces negative values to zero.
+
         Returns:
             DataFrame
 
     """
+
     data = pd.read_csv(filename,index_col=0)
-    data.columns = [float(n) for n in data.columns]
+    if instrument:
+        #this means we probably have a date/timestamp on the columns
+        data = pd.read_csv(filename,index_col=0, parse_dates = True)
+        data = data.T
+        for n in data.index:
+            h,m,s = n.split(':')
+            sec = (float(h)*60+float(m))*60+float(s)
+            data.rename(index={n:sec}, inplace=True)
+        data.index = [float(n) for n in data.index]
+    else:
+        data.columns = [float(n) for n in data.columns]
+
+    #If we have negative values then this makes them equal to zero
+    if negatives_to_zero:
+        for t in (data.index):
+            for l in data.columns:
+                if data.loc[t,l] < 0:
+                    data.loc[t,l] = 0.0
+
     return data
 
 def read_absorption_data_from_csv(filename):
@@ -293,52 +318,73 @@ def plot_spectral_data(dataFrame,dimension='2D'):
         plt.figure()
         plt.plot(dataFrame)
 
-
-def basic_pca(dataFrame,n=4):
+#=============================================================================
+#--------------------------- DIAGNOSTIC TOOLS ------------------------
+#=============================================================================
+        
+def basic_pca(dataFrame,n=None,with_plots=False):
     """ Runs basic component analysis based on SVD
     
         Args:
             dataFrame (DataFrame): spectral data
             
-            n (int, optional): number of largest singular-values
+            n (int): number of largest singular-values
             to plot
+            
+            with_plots (boolean): argument for files with plots due to testing
 
         Returns:
             None
 
     """
+            
     times = np.array(dataFrame.index)
     lambdas = np.array(dataFrame.columns)
     D = np.array(dataFrame)
+    #print("D shape: ", D.shape)
     U, s, V = np.linalg.svd(D, full_matrices=True)
-    plt.subplot(1,2,1)
+    #print("U shape: ", U.shape)
+    #print("s shape: ", s.shape)
+    #print("V shape: ", V.shape)
+    #print("sigma/singular values", s)
+    if n == None:
+        print("WARNING: since no number of components is specified, all components are printed")
+        print("It is advised to select the number of components for n")
+        n_shape = s.shape
+        n = n_shape[0]
+        
     u_shape = U.shape
+    #print("u_shape[0]",u_shape[0])
     n_l_vector = n if u_shape[0]>=n else u_shape[0]
-    for i in range(n_l_vector):
-        plt.plot(times,U[:,i])
-    plt.xlabel("time")
-    plt.ylabel("Components U[:,i]")
-
-    plt.subplot(1,2,2)
     n_singular = n if len(s)>=n else len(s)
     idxs = range(n_singular)
     vals = [s[i] for i in idxs]
-    plt.semilogy(idxs,vals,'o')
-    plt.xlabel("i")
-    plt.ylabel("singular values")
-    """
-    plt.subplot(1,3,3)
     v_shape = V.shape
     n_r_vector = n if v_shape[0]>=n else v_shape[0]
-    for i in range(n_r_vector):
-        plt.plot(lambdas,V[i,:])
-    plt.xlabel("wavelength")
-    plt.ylabel("Components V[i,:]")
-    """
-        
-
     
-def gausian_single_peak(wl,alpha,beta,gamma):
+    if with_plots:
+        for i in range(n_l_vector):
+            plt.plot(times,U[:,i])
+        plt.xlabel("time")
+        plt.ylabel("Components U[:,i]")
+        plt.show()
+        
+        plt.semilogy(idxs,vals,'o')
+        plt.xlabel("i")
+        plt.ylabel("singular values")
+        plt.show()
+        
+        for i in range(n_r_vector):
+            plt.plot(lambdas,V[i,:])
+        plt.xlabel("wavelength")
+        plt.ylabel("Components V[i,:]")
+        plt.show()
+     
+#=============================================================================
+#---------------------------PROBLEM GENERATION TOOLS------------------------
+#============================================================================= 
+    
+def gaussian_single_peak(wl,alpha,beta,gamma):
     """
     helper function to generate absorption data based on 
     lorentzian parameters
@@ -350,7 +396,7 @@ def absorbance(wl,alphas,betas,gammas):
     helper function to generate absorption data based on 
     lorentzian parameters
     """
-    return sum(gausian_single_peak(wl,alphas[i],betas[i],gammas[i]) for i in range(len(alphas)))
+    return sum(gaussian_single_peak(wl,alphas[i],betas[i],gammas[i]) for i in range(len(alphas)))
 
 def generate_absorbance_data(wl_span,parameters_dict):
     """
@@ -414,6 +460,7 @@ def add_noise_to_signal(signal, size):
     df= pd.DataFrame(data=sig)
     df[df<0]=0
     return df
+
 #=============================================================================
 #---------------------------PRE-PROCESSING TOOLS------------------------
 #=============================================================================
@@ -476,7 +523,13 @@ def savitzky_golay(dataFrame, window_size, orderPoly, orderDeriv=0):
         y = np.concatenate((firstvals, row, lastvals))
         new_row = np.convolve( m, y, mode='valid')
         no_noise[t]=new_row
-
+        
+    if orderDeriv == 0:
+        for t in range(len(dataFrame.index)):
+            for l in range(len(dataFrame.columns)):
+                if no_noise[t,l] < 0:
+                    no_noise[t,l] = 0
+    
     data_frame = pd.DataFrame(data=no_noise,
                               columns = dataFrame.columns,
                               index=dataFrame.index)
@@ -598,3 +651,77 @@ def msc(dataFrame, reference_spectra=None):
                               columns = dataFrame.columns,
                               index=dataFrame.index)
     return data_frame
+
+def baseline_shift(dataFrame, shift=None):
+    """
+    Implementation of basic baseline shift. 2 modes are avaliable: 1. Automatic mode that requires no
+    user arguments. The method identifies the lowest value (NOTE THAT THIS ONLY WORKS IF LOWEST VALUE
+    IS NEGATIVE) and shifts the spectra up until this value is at zero. 2. Baseline shift provided by
+    user. User provides the number that is added to every wavelength value in the full spectral dataset.
+    
+    
+    Args:
+        dataFrame (DataFrame): the data to be processed (spectral data)
+        shift (float, optional): user-defined baseline shift
+        
+    Returns:
+        DataFrame containing pre-processed data
+    
+    References:
+
+    """
+    # data checks
+    if not isinstance(dataFrame, pd.DataFrame):
+        raise TypeError("data must be inputted as a pandas DataFrame, try using read_spectral_data_from_txt or similar function first")
+    print("Applying the baseline shift pre-processing") 
+    if shift == None:
+        shift = float(dataFrame.min().min())*(-1)
+    
+    print("shifting dataset by: ", shift)    
+    D = np.array(dataFrame)
+    for t in range(len(dataFrame.index)):
+        for l in range(len(dataFrame.columns)):
+            D[t,l] = D[t,l]+shift
+    
+    data_frame = pd.DataFrame(data=D, columns = dataFrame.columns, index = dataFrame.index)
+    return data_frame
+
+def decrease_wavelengths(original_dataset, A_set = 2, specific_subset = None):
+    '''
+    Takes in the original, full dataset and removes specific wavelengths, or only keeps every
+    multipl of A_set. Returns a new, smaller dataset that should be easier to solve
+    
+    Args:
+        original_dataset (DataFrame):   the data to be processed
+        A_set (float, optional):  optional user-provided multiple of wavelengths to keep. i.e. if
+                                    3, every third value is kept. Default is 2.
+        specific_subset (list or dict, optional): If the user already knows which wavelengths they would like to
+                                    remove, then a list containing these can be included.
+        
+    Returns:
+        DataFrame with the smaller dataset
+    
+    '''
+    if specific_subset != None:
+        if not isinstance(specific_subset, (list, dict)):
+            raise RuntimeError("subset must be of type list or dict!")
+             
+        if isinstance(specific_subset, dict):
+            lists1 = sorted(specific_subset.items())
+            x1, y1 = zip(*lists1)
+            specific_subset = list(x1)
+            
+        new_D = pd.DataFrame(np.nan,index=original_dataset.index, columns = specific_subset)
+        for t in original_dataset.index:
+            for l in original_dataset.columns.values:
+                if l in subset:
+                    new_D.at[t,l] = self.model.D[t,l]           
+    else:
+        count=0
+        for l in original_dataset.columns.values:
+            remcount = count%A_set
+            if remcount==0:
+                original_dataset.drop(columns=[l],axis = 1)
+            count+=1
+        new_D = original_dataset[original_dataset.columns[::A_set]]     
+    return new_D

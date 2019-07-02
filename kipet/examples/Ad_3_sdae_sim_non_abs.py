@@ -101,7 +101,7 @@ if __name__ == "__main__":
      
     # create instance of simulator
     simulator = PyomoSimulator(sim_model)
-    simulator.apply_discretization('dae.collocation',nfe=8,ncp=3,scheme='LAGRANGE-RADAU')
+    simulator.apply_discretization('dae.collocation',nfe=20,ncp=3,scheme='LAGRANGE-RADAU')
     
     # simulate with fixed variances
     sigmas = {'device':1e-8,
@@ -133,10 +133,10 @@ if __name__ == "__main__":
     #: non absorbing species.
 
     builder.set_non_absorbing_species(opt_model, non_abs)
+    opt_model = builder.create_pyomo_model(0.0, 50.0)
     #################################################################################
-  
     v_estimator = VarianceEstimator(opt_model)
-    v_estimator.apply_discretization('dae.collocation',nfe=8,ncp=3,scheme='LAGRANGE-RADAU')
+    v_estimator.apply_discretization('dae.collocation',nfe=20,ncp=3,scheme='LAGRANGE-RADAU')
     
     v_estimator.initialize_from_trajectory('Z',results_sim.Z)
     v_estimator.initialize_from_trajectory('S',results_sim.S)
@@ -159,8 +159,9 @@ if __name__ == "__main__":
 
     opt_model = builder.create_pyomo_model(0.0,50.0)
     builder.set_non_absorbing_species(opt_model, non_abs)
+    opt_model = builder.create_pyomo_model(0.0,50.0)
     p_estimator = ParameterEstimator(opt_model)
-    p_estimator.apply_discretization('dae.collocation',nfe=8,ncp=3,scheme='LAGRANGE-RADAU')
+    p_estimator.apply_discretization('dae.collocation',nfe=20,ncp=3,scheme='LAGRANGE-RADAU')
     
     p_estimator.initialize_from_trajectory('Z',results_variances.Z)
     p_estimator.initialize_from_trajectory('S',results_variances.S)
@@ -181,16 +182,14 @@ if __name__ == "__main__":
         # display concentration and absorbance results
         results_p.C.plot.line(legend=True)
         plt.plot(results_sim.C.index,results_sim.C['A'],'*',
-                 results_sim.C.index,results_sim.C['B'],'*',
-                 results_sim.C.index,results_sim.C['C'],'*')
+                 results_sim.C.index,results_sim.C['B'],'*')
         plt.xlabel("time (s)")
         plt.ylabel("Concentration (mol/L)")
         plt.title("Concentration Profile")
 
         results_p.S.plot.line(legend=True)
         plt.plot(results_sim.S.index,results_sim.S['A'],'*',
-                 results_sim.S.index,results_sim.S['B'],'*',
-                 results_sim.S.index,results_sim.S['C'],'*')
+                 results_sim.S.index,results_sim.S['B'],'*')
         plt.xlabel("Wavelength (cm)")
         plt.ylabel("Absorbance (L/(mol cm))")
         plt.title("Absorbance  Profile")

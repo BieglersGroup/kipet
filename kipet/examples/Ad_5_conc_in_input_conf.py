@@ -34,7 +34,7 @@ if __name__ == "__main__":
     ######################################  
      # create template model 
     species = {'A':6.7, 'B':20.2, 'C':0.0}
-    params = {'k_p':3.734e7}
+    params = {'k_p':2.5e7}
 
     builder = TemplateBuilder()   
 
@@ -144,7 +144,7 @@ if __name__ == "__main__":
 
     # finally we run the optimization
     
-    results_pyomo = p_estimator.run_opt('ipopt_sens',
+    results_pyomo = p_estimator.run_opt('k_aug',
                                         tee=True,
                                         solver_opts=options,
                                         variances=sigmas,
