@@ -382,6 +382,7 @@ class PyomoSimulator(Simulator):
         tee = kwds.pop('tee', False)
         seed = kwds.pop('seed', None)
 
+
         if not self.model.time.get_discretization_info():
             raise RuntimeError('apply discretization first before runing simulation')
 

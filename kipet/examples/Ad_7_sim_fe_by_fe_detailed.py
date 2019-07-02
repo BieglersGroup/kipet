@@ -158,7 +158,8 @@ if __name__ == "__main__":
                          init_con="init_conditions_c",
                          param_name=param_name,
                          param_values=param_dict,
-                         inputs_sub=inputs_sub)
+                         inputs_sub=inputs_sub,
+                         solver="/home/dav0/in_dev_/ipopt_vanilla_l1/builds/ipopt_l1/bin/ipopt")
     
     init.load_initial_conditions(init_cond=ics_)
    
@@ -171,7 +172,7 @@ if __name__ == "__main__":
     #: now the final run, just as before
     # simulate
     options = {}
-    results = sim.run_sim('ipopt',
+    results = sim.run_sim('/home/dav0/in_dev_/ipopt_vanilla_l1/builds/ipopt_l1/bin/ipopt',
                           tee=True,
                           solver_opts=options)
     if with_plots:

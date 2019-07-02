@@ -54,7 +54,7 @@ class FESimulator(PyomoSimulator):
             if t[0] == st:
                 self.ics_['X',t[1]] = v.value
 
-    def call_fe_factory(self, inputs_sub=None, jump_states=None, jump_times=None, feed_times=None):#added for inclusion of discrete jumps CS
+    def call_fe_factory(self, inputs_sub=None, jump_states=None, jump_times=None, feed_times=None, solver="ipopt"):#added for inclusion of discrete jumps CS
         """
         call_fe_factory:
     
@@ -78,7 +78,8 @@ class FESimulator(PyomoSimulator):
                          init_con="init_conditions_c",
                          param_name=self.param_name,
                          param_values=self.param_dict,
-                         inputs_sub=self.inputs_sub)
+                         inputs_sub=self.inputs_sub,
+                             solver=solver)
     
         init.load_initial_conditions(init_cond=self.ics_)
 
