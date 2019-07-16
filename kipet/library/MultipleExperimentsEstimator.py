@@ -114,7 +114,7 @@ class MultipleExperimentsEstimator(object):
                         self._idx_to_variable[count_vars] = v
                         self.model.red_hessian[v] = count_vars
                         count_vars += 1
-            #print("count after S exp",i, count_vars)             
+            #print("count after S exp",i, count_vars)
         #print("count after S",i, count_vars) 
 
         for i in self.experiments:
@@ -846,7 +846,8 @@ class MultipleExperimentsEstimator(object):
             if not 'compute_red_hessian' in solver_opts.keys():
                 solver_opts['compute_red_hessian'] = 'yes'
         if solver == 'k_aug':
-            solver_opts['compute_inv'] = ''
+            # solver_opts['compute_inv'] = ''
+            pass
 
         optimizer = SolverFactory(solver)
         for key, val in solver_opts.items():
@@ -894,6 +895,7 @@ class MultipleExperimentsEstimator(object):
             m.rh_name = Suffix(direction=Suffix.IMPORT)  #: SUFFIX FOR K_AUG AS WELL
     
             count_vars = 1
+
             for i in self.experiments:
                 if not self._spectra_given:
                     pass
@@ -912,35 +914,36 @@ class MultipleExperimentsEstimator(object):
                             m.experiment[i].S[l, c].set_suffix_value(m.dof_v, count_vars)
                             count_vars += 1
     
-                for v in six.itervalues(self.model.experiment[i].P):
-                    if v.is_fixed():
-                        continue
-                    m.experiment[i].P.set_suffix_value(m.dof_v, count_vars)
-                    count_vars += 1
+            for k, v in six.iteritems(self.model.experiment[self.experiments[0]].P):  #: is this correct? :S
+                if v.is_fixed():
+                    continue
+                v.set_suffix_value(m.dof_v, count_vars)
+                count_vars += 1
             
             print("count_vars:", count_vars)
             self._tmpfile = "k_aug_hess"
-            ip = SolverFactory('ipopt')
-            with open("ipopt.opt", "w") as f:
-                f.write("print_info_string yes")
-                f.close()
-                
+            ip = SolverFactory('ipopt')  #: this needs to be changed
+
             m.write(filename="ip.nl", format=ProblemFormat.nl)
+            with open("ipopt.opt", "w") as f:
+                f.write("print_info_string yes\n")
+                f.write("linear_solver ma57\n")
             solver_results = ip.solve(m, tee=m.tee, 
                                       options = solver_opts,
                                       logfile=self._tmpfile,
                                       report_timing=True)
             
             m.write(filename="ka.nl", format=ProblemFormat.nl)
+            m.pprint(filename="myfile")
             k_aug = SolverFactory('k_aug')
-            # k_aug.options["compute_inv"] = ""
+            k_aug.options["compute_inv"] = ""
             m.ipopt_zL_in.update(m.ipopt_zL_out)  #: be sure that the multipliers got updated!
             m.ipopt_zU_in.update(m.ipopt_zU_out)
             # m.write(filename="mynl.nl", format=ProblemFormat.nl)
-            k_aug.solve(m, tee=False)
+            k_aug.solve(m, tee=True)
             print("Done solving building reduce hessian")
     
-            if not all_sigma_specified:
+            if not all_sigma_specified:  ##: I dunno what is this.
                 raise RuntimeError(
                     'All variances must be specified to determine covariance matrix.\n Please pass variance dictionary to run_opt')
     
@@ -1054,24 +1057,24 @@ class MultipleExperimentsEstimator(object):
             m.dof_v.pprint()
             m.rh_name.pprint()
             count_vars = 1
-        
-            if not self._spectra_given:
-                pass
-            else:
-                for t in m.experiment[i].meas_times:
-                    for c in self._sublist_components[i]:
-                        m.experiment[i].C[t, c].set_suffix_value(m.dof_v, count_vars)
+            for i in self.experiments:
+                if not self._spectra_given:
+                    pass
+                else:
+                    for t in m.experiment[i].meas_times:
+                        for c in self._sublist_components[i]:
+                            m.experiment[i].C[t, c].set_suffix_value(m.dof_v, count_vars)
 
-                        count_vars += 1
-                        
+                            count_vars += 1
 
-            if not self._spectra_given:
-                pass
-            else:
-                for l in self._meas_lambdas:
-                    for c in self._sublist_components:
-                        m.S[l, c].set_suffix_value(m.dof_v, count_vars)
-                        count_vars += 1
+            for i in self.experiments:
+                if not self._spectra_given:
+                    pass
+                else:
+                    for l in self.model.experiment[i]._meas_lambdas:
+                        for c in self._sublist_components[i]:
+                            m.experiment[i].S[l, c].set_suffix_value(m.dof_v, count_vars)
+                            count_vars += 1
 
             var_counted = list()
             
@@ -1079,8 +1082,8 @@ class MultipleExperimentsEstimator(object):
             
             for i in self.experiments:
                 for k,v in six.iteritems(self.model.experiment[i].P):
-                    #print(k,v)                    
-                    if k not in var_counted:
+                    #print(k,v)
+                    if k not in var_counted: #: @dthierry: hit or miss? uh..
                         #print(count_vars)
                         #print(k,v)
                         if v.is_fixed():  #: Skip the fixed ones
@@ -1092,7 +1095,7 @@ class MultipleExperimentsEstimator(object):
                     var_counted.append(k)
                     
             self._tmpfile = "k_aug_hess"
-            ip = SolverFactory('ipopt')
+            ip = SolverFactory('ipopt')  #: this needs to be optional
             solver_results = ip.solve(m, tee=tee,
                                       logfile=self._tmpfile,
                                       report_timing=True)
@@ -1104,7 +1107,7 @@ class MultipleExperimentsEstimator(object):
             m.ipopt_zU_in.update(m.ipopt_zU_out)
             # m.write(filename="mynl.nl", format=ProblemFormat.nl)
             #print("do we get here?")
-            k_aug.solve(m, tee=False)
+            k_aug.solve(m, tee=True)
             print("Done solving building reduce hessian")
 
             if not all_sigma_specified:
@@ -1347,7 +1350,7 @@ class MultipleExperimentsEstimator(object):
                     ind_p_est[l] = ParameterEstimator(self.opt_model[l])
                     ind_p_est[l].apply_discretization('dae.collocation',nfe=nfe,ncp=ncp,scheme='LAGRANGE-RADAU')
                     
-                    results_pest[l] = ind_p_est[l].run_opt('ipopt',
+                    results_pest[l] = ind_p_est[l].run_opt('/home/dav0/in_dev_/ipopt_vanilla_l1/builds/ipopt_l1/bin/ipopt',
                                                          tee=tee,
                                                           solver_opts = solver_opts,
                                                           variances = sigma_sq[l])

@@ -266,7 +266,7 @@ class ParameterEstimator(Optimizer):
             m.ipopt_zL_in.update(m.ipopt_zL_out)  #: be sure that the multipliers got updated!
             m.ipopt_zU_in.update(m.ipopt_zU_out)
             # m.write(filename="mynl.nl", format=ProblemFormat.nl)
-            k_aug.solve(m, tee=False)
+            k_aug.solve(m, tee=True)
             print("Done solving building reduce hessian")
 
             if not all_sigma_specified:
