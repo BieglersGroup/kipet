@@ -5,12 +5,16 @@ from pyomo.environ import *
 from pyomo.dae import *
 from pyomo.opt import SolverFactory, ProblemFormat, TerminationCondition
 from pyomo import *
+from pyomo.core.base.sets import _SetProduct
 #from pyomo.core.kernel.numvalue import value as value
 from os import getcwd, remove
 import sys
 import six
 from pyomo.core.expr import current as EXPR
 from pyomo.core.expr.numvalue import NumericConstant
+import numpy as np
+import math
+import pandas as pd
 
 
 __author__ = 'David M Thierry'  #: April 2018
@@ -67,7 +71,20 @@ class fe_initialize(object):
                     inputs (dict): The input dictionary. Use this dictonary for single index (time) inputs
                     inputs_sub (dict): The multi-index dictionary. Use this dictionary for multi-index inputs.
                 """
-
+        def identify_member_sets(index): #update for pyomo 5.6.8 KH.L
+            queue = [index]
+            ans = []
+            n = 0
+            while queue:
+                n+=1
+                s = queue.pop(0)
+                if not isinstance(s, _SetProduct):
+                    ans.append(s)
+                else:
+                    queue.extend(s.set_tuple) 
+            if n == 1:
+                ans = None
+            return ans
 
 
 
@@ -75,7 +92,9 @@ class fe_initialize(object):
         self.ip.options['halt_on_ampl_error'] = 'yes'
         self.ip.options['print_user_options'] = 'yes'
         self.tgt = tgt_mod
+
         self.mod = src_mod.clone()  #: Deepcopy of the reference model
+
         zeit = None
         for i in self.mod.component_objects(ContinuousSet):
             zeit = i
@@ -91,16 +110,24 @@ class fe_initialize(object):
         fe_l = tgt_cts.get_finite_elements()
         self.fe_list = [fe_l[i + 1] - fe_l[i] for i in range(0, len(fe_l) - 1)]
         self.nfe = len(self.fe_list)  #: Create a list with the step-size
+
         #: Re-construct the model with [0,1] time domain
         zeit = getattr(self.mod, self.time_set)
-        #print()
+
         zeit._bounds = (0, 1)
         zeit.clear()
         zeit.construct()
-        for i in self.mod.component_objects([Var, Constraint, DerivativeVar]):
+        for i in self.mod.component_objects(Var):
+            i.clear()
+            i.reconstruct()
+        for i in self.mod.component_objects(Var):
+            i.clear()
+            i.reconstruct()
+        for i in self.mod.component_objects(Constraint):
             i.clear()
             i.construct()
 
+        # self.mod.display(filename="selfmoddisc0.txt")
         #: Discretize
         d = TransformationFactory('dae.collocation')
         d.apply_to(self.mod, nfe=1, ncp=self.ncp, scheme='LAGRANGE-RADAU')
@@ -117,6 +144,7 @@ class fe_initialize(object):
                     self.dvar_names.append(namel[0])
                     self.dvs_names.append(realname.get_state_var().name)
         self.mod.h_i = Param(zeit, mutable=True, default=1.0)  #: Length of finite element
+
         #: Modify the collocation equations to introduce h_i (the length of finite element)
         for i in self.dvar_names:
             con = getattr(self.mod, i + '_disc_eq')
@@ -150,7 +178,9 @@ class fe_initialize(object):
                 #print(i, 'here')
                 self.remaining_set[i] = None
                 continue
-            set_i = dv._implicit_subsets  #: More than just time set
+            #set_i = dv._implicit_subsets  #: More than just time set
+            #set_i = dv._index._implicit_subsets #Update for pyomo 5.6.8 KH.L
+            set_i = identify_member_sets(dv.index_set())
             remaining_set = set_i[1]
             for s in set_i[2:]:
                 remaining_set *= s
@@ -162,13 +192,17 @@ class fe_initialize(object):
         #: Algebraic variables
         self.weird_vars = [] #:Not indexed by time
         self.remaining_set_alg = {}
+        # with open('model_check.txt', 'w') as f5:
+        #     self.mod.pprint(ostream = f5)
         for av in self.mod.component_objects(Var):
             if av.name in self.dvs_names:
                 continue
             if av.index_set().name == zeit.name:  #: Just time set
                 self.remaining_set_alg[av.name] = None
                 continue
-            set_i = av._implicit_subsets
+            #set_i = av._implicit_subsets 
+            #set_i = av._index._implicit_subsets #Update for pyomo 5.6.8 KH.L
+            set_i = identify_member_sets(av.index_set())
             if set_i is None or not zeit in set_i:
                 self.weird_vars.append(av.name)  #: Not indexed by time!
                 continue  #: if this happens we might be in trouble
@@ -252,7 +286,9 @@ class fe_initialize(object):
                 if p.index_set().name == zeit.name:  #: Only time-set
                     self.input_remaining_set[i] = None
                     continue
-                set_i = p._implicit_subsets
+                #set_i = p._implicit_subsets
+                #set_i = p._index._implicit_subsets #Update for pyomo 5.6.8 KH.L
+                set_i = identify_member_sets(p.index_set())
                 if not zeit in set_i:
                     raise RuntimeError("{} is not by index by time, this can't be an input".format(i))
                 remaining_set = set_i[1]
@@ -276,14 +312,16 @@ class fe_initialize(object):
                 if not isinstance(self.inputs_sub[key], list):
                     raise TypeError("input_sub[{}] must be a list".format(key))
                 p = getattr(self.mod, key)
-                if p._implicit_subsets is None:
+                #if p._implicit_subsets is None:
+                if identify_member_sets(p.index_set()) is None: #Update for pyomo 5.6.8 KH.L
                     raise RuntimeError("This variable is does not have multiple indices"
                                        "Pass {} as part of the inputs keyarg instead.".format(key))
                 elif p.index_set().name == zeit.name:
                     raise RuntimeError("This variable is indexed over time"
                                        "Pass {} as part of the inputs keyarg instead.".format(key))
                 else:
-                    if not zeit in p._implicit_subsets:
+                    #if not zeit in p._implicit_subsets:
+                    if not zeit in identify_member_sets(p.index_set()): #Update for pyomo 5.6.8 KH.L
                         raise RuntimeError("{} is not indexed over time; it can not be an input".format(key))
                 for k in self.inputs_sub[key]:
                     if isinstance(k, str) or isinstance(k, int) or isinstance(k, tuple):
@@ -295,11 +333,10 @@ class fe_initialize(object):
 
         #: Check nvars and mequations
         (n, m) = reconcile_nvars_mequations(self.mod)
+        # self.mod.display(filename="selfmod1.txt")
         if n != m:
             raise Exception("Inconsistent problem; n={}, m={}".format(n, m))
         self.jump = False
-
-
 
     def load_initial_conditions(self, init_cond=None):
         if not isinstance(init_cond, dict):
@@ -307,7 +344,7 @@ class fe_initialize(object):
 
         for i in self.dvs_names:
             dv = getattr(self.mod, i)
-            ts = getattr(self.mod, self.time_set)
+            ts = getattr(self.mod, self.time_set)#self.mod.alltime
             for t in ts:
                 for s in self.remaining_set[i]:
                     if s is None:
@@ -354,7 +391,7 @@ class fe_initialize(object):
         #for i in self.mod.Z.itervalues():
             #i.setlb(0)
         self.ip.options["print_level"] = 1  #: change this on demand
-        self.ip.options["OF_start_with_resto"] = 'no'
+        # self.ip.options["start_with_resto"] = 'no'
         self.ip.options['bound_push'] = 1e-02
         sol = self.ip.solve(self.mod, tee=True, symbolic_solver_labels=True)
 
@@ -432,8 +469,6 @@ class fe_initialize(object):
         t_last = t_ij(ts, 0, self.ncp)
 
         #Inclusion of discrete jumps: (CS)
-        ttgt = getattr(self.tgt, self.time_set)
-
         for i in self.dvs_names:
             dv = getattr(self.mod, i)
             for s in self.remaining_set[i]:
@@ -461,6 +496,10 @@ class fe_initialize(object):
         ###########################
         ts = getattr(self.mod, self.time_set)
         ttgt = getattr(self.tgt, self.time_set)
+        # with open('model_mod.txt', 'w') as f1:
+        #     self.mod.pprint(ostream = f1)
+        # with open('model_tgt.txt', 'w') as f2:
+        #     self.tgt.pprint(ostream = f2)
         for v in self.mod.component_objects(Var, active=True):
             v_tgt = getattr(self.tgt, v.name)
             if v.name in self.weird_vars:  #: This has got to work.
@@ -580,7 +619,7 @@ class fe_initialize(object):
 
         """
         print("*"*5, end='\t')
-        print("Fe Factory: fe_initialize by DT \@2018", end='\t')
+        print("Fe Factory: fe_initialize \@2018", end='\t')  # davs: :)
         print("*" * 5)
         print("*" * 5 + '\tSolving for {} elements\t'.format(len(self.fe_list)) + "*" * 5 )
         for i in range(0, len(self.fe_list)):
@@ -685,7 +724,7 @@ def write_nl(d_mod, filename=None):
     if not filename:
         filename = d_mod.name + '.nl'
     d_mod.write(filename, format=ProblemFormat.nl,
-                io_options={"symbolic_solver_labels": False})
+                io_options={"symbolic_solver_labels": True})
     cwd = getcwd()
     print("nl file {}".format(cwd + "/" + filename))
     return cwd
@@ -712,10 +751,10 @@ def reconcile_nvars_mequations(d_mod):
         nvar = int(newl[0])
         meqn = int(newl[1])
         nl.close()
-    try:
-        remove(fullpth)
-    except OSError:
-        pass
+    #try:
+    #    remove(fullpth)
+    #except OSError:
+    #    pass
     return (nvar, meqn)
 
 

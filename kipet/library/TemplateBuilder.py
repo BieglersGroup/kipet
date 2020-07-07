@@ -1,35 +1,67 @@
-import six
-import pandas as pd
-import itertools
-import inspect
-import numbers
 import copy
+import inspect
+import itertools
 import logging
+import numbers
+import six
+import sys
 import warnings
 
+import numpy as np
+import pandas as pd
 from pyomo.environ import *
 from pyomo.dae import *
-import numpy as np
-import sys
 
 try:
     if sys.version_info.major > 3:
         import importlib
-
         importlib.util.find_spec("casadi")
     else:
         import imp
-
         imp.find_module('casadi')
+
     from kipet.library.CasadiModel import CasadiModel
     from kipet.library.CasadiModel import KipetCasadiStruct
-
     found_casadi = True
+
 except ImportError:
     found_casadi = False
 
 logger = logging.getLogger('ModelBuilderLogger')
+    
 
+class KineticParameter():
+    """A simple class for holding kinetic parameter data"""
+
+    def __init__(self, name, bounds=None, init=None, uncertainty=None):
+
+        self.name = name
+        self.bounds = bounds
+        self.init = init
+        self.uncertainty = uncertainty
+        
+    def __str__(self):
+        return f'KineticParameter: {self.name}, bounds={self.bounds}, init={self.init}, variance={self.uncertainty}'
+
+    def __repr__(self):
+        return f'KineticParameter: {self.name}, bounds={self.bounds}, init={self.init}, variance={self.uncertainty}'
+
+
+class Component():
+    """A simple class for holding component information"""
+    
+    def __init__(self, name, init, sigma=1, state='concentration'):
+    
+        self.name = name
+        self.init = init
+        self.sigma = sigma
+        self.state = state
+
+    def __str__(self):
+        return f'Component: {self.name}, init={self.init}, sigma={self.sigma}'
+    
+    def __repr__(self):
+        return f'Component: {self.name}, init={self.init}, sigma={self.sigma}'
 
 class TemplateBuilder(object):
     """Helper class for creation of models.
@@ -50,6 +82,10 @@ class TemplateBuilder(object):
         _odes (Function): function specified by user to return dictionary with ODE expressions
 
         _meas_times (set, optional): container of measurement times
+
+        _huplcmeas_times (set, optional): container of  H/UPLC measurement times
+
+        _allmeas_times (set, optional): container of all measurement times
 
         _feed_times (set, optional): container of feed times
 
@@ -73,14 +109,27 @@ class TemplateBuilder(object):
         self._parameters = dict()
         self._parameters_init = dict()  # added for parameter initial guess CS
         self._parameters_bounds = dict()
+        self._smoothparameters = dict()  # added for mutable parameters CS
+        self._smoothparameters_mutable = dict() #added for mutable parameters CS
+
+        #added for initial condition parameter estimates: CS
+        self._initextraparams = dict()
+        self._initextraparams_init = dict()  # added for parameter initial guess CS
+        self._initextraparams_bounds = dict()
+
         self._y_bounds = dict()  # added for additional optional bounds CS
         self._prof_bounds = list()  # added for additional optional bounds MS
         self._init_conditions = dict()
         self._spectral_data = None
         self._concentration_data = None
+        self._complementary_states_data = None # added for complementary state data (Est.) KM
+        self._huplc_data = None #added for additional data CS
+        self._smoothparam_data = None  # added for additional smoothing parameter data CS
         self._absorption_data = None
         self._odes = None
         self._meas_times = set()
+        self._huplcmeas_times = set() #added for additional data CS
+        self._allmeas_times = set() #added for new data structure CS
         self._m_lambdas = None
         self._complementary_states = set()
         self._algebraics = dict()
@@ -91,9 +140,30 @@ class TemplateBuilder(object):
         self._known_absorbance_data = None
         self._non_absorbing = None
         self._is_non_abs_set = False
+        self._huplc_absorbing = None #for add additional data CS
+        self._is_huplc_abs_set = False #for add additional data CS
+        self._vol = None #For add additional data CS
         self._feed_times = set()  # For inclusion of discrete feeds CS
         self._is_D_deriv = False
         self._is_C_deriv = False
+        self._is_U_deriv = False
+        self._is_Dhat_deriv = False
+        self._state_sigmas = None # Need to put sigmas into the pyomo model as params
+        self._model_constants = None # Used in EstimaationPotential
+        self._scale_parameters = False # Should be True for EstimationPotential (automatic)
+        self._times = None
+        self._all_state_data = list()
+
+        #New for estimate initial conditions of complementary states CS:
+        self._estim_init = False
+        self._allinitcomponents=dict()
+        self._initextra_est_list = None
+        
+        # bounds and init for unwanted contributions KH.L
+        self._qr_bounds = None
+        self._qr_init = None
+        self._g_bounds = None
+        self._g_init = None
 
         components = kwargs.pop('concentrations', dict())
         if isinstance(components, dict):
@@ -134,6 +204,76 @@ class TemplateBuilder(object):
 
         else:
             raise RuntimeError('concentrations must be an dictionary component_name:init_condition')
+        
+         #For initial condition parameter estimates:
+        initextraparams = kwargs.pop('initextraparams', dict())
+        if isinstance(initextraparams, dict):
+            for k, v in initextraparams.items():
+                self._initextraparams[k] = v
+        elif isinstance(initextraparams, list):
+            for k in initextraparams:
+                self._initextraparams[k] = None
+        else:
+            raise RuntimeError('initextraparams must be a dictionary species_name:value or a list with species_names')
+
+
+    def set_parameter_scaling(self, use_scaling: bool):
+        """Makes an option to use the scaling method implemented for estimability
+        
+        Args:
+            use_scaling (bool): Defaults to False, for using scaled parameters
+            
+        Returns:
+            None
+        
+        """
+        self._scale_parameters = use_scaling
+    
+        return None
+        
+    def set_model_times(self, times):
+        """Add the times to the builder template.
+        
+        Args:
+            times (iterable): start and end times for the pyomo model
+        
+        Returns:
+            None
+            
+        """
+        self._times = times
+        
+    def add_state_variance(self, sigma_dict):
+        """Provide a variance for the measured states
+        
+        Args:
+            sigma (dict): A dictionary of the measured states with known 
+            variance. Provide the value of sigma (standard deviation).
+            
+        Returns:
+            None
+        """
+        self._state_sigmas = sigma_dict
+        # perhaps make this more secure later on and account for different input types
+        return None
+    
+    def add_model_constants(self, constant_dict):
+        """Add constants to the model (nominal parameters that are changed in
+        the estimability calculations)
+        
+        Args:
+            constant_dict (dict): A dict containing the nominal parameter
+            values.
+            
+        Returns:
+            None
+        """
+        if isinstance(constant_dict, dict):
+            self._model_constants = constant_dict
+        else:
+            raise TypeError('Model constants must be given as a dict')
+            
+        return None
 
     def add_parameter(self, *args, **kwds):
         """Add a kinetic parameter(s) to the model.
@@ -157,7 +297,7 @@ class TemplateBuilder(object):
         """
         bounds = kwds.pop('bounds', None)
         init = kwds.pop('init', None)
-
+        
         if len(args) == 1:
             name = args[0]
             if isinstance(name, six.string_types):
@@ -196,17 +336,85 @@ class TemplateBuilder(object):
                 if bounds is not None:
                     self._parameters_bounds[first] = bounds
                 if init is not None:
-                    self._parameter_init[first] = init
+                    self._parameters_init[first] = init
             else:
                 raise RuntimeError('Parameter argument not supported. Try str,val')
         else:
             raise RuntimeError('Parameter argument not supported. Try str,val')
 
+
+    def add_smoothparameter(self, *args, **kwds): #added for smoothingparameter (CS)
+        """Add a kinetic parameter(s) to the model.
+
+        Note:
+            Plan to change this method add parameters as PYOMO variables
+
+            This method tries to mimic a template implementation. Depending
+            on the argument type it will behave differently
+
+        Args:
+            param1 (boolean): Mutable value. Creates a variable mutable
+
+        Returns:
+            None
+
+        """
+        # bounds = kwds.pop('bounds', None)
+        # init = kwds.pop('init', None)
+        mutable = kwds.pop('mutable', False)
+
+        if len(args) == 2:
+            first = args[0]
+            second = args[1]
+            if isinstance(first, six.string_types):
+                self._smoothparameters[first] = second
+                if mutable is not False and second is pd.DataFrame:
+                    self._smoothparameters_mutable[first] = mutable #added for mutable parameters CS
+            else:
+                raise RuntimeError('Parameter argument not supported. Try pandas.Dataframe and mutable=True')
+        else:
+            raise RuntimeError('Parameter argument not supported. Try pandas.Dataframe and mutable=True')
+
+    def _add_state_variable(self, *args, data_type=None):
+        
+        built_in_data_types = {
+            'concentration' : ('component_names', 'Mixture component'),
+            'complementary_states' : ('complementary_states', 'Complementary state'),
+           }
+        
+        if len(args) == 1:
+            input = args[0]
+            if isinstance(input, dict):
+                for key, val in input.items():
+                    if not isinstance(val, numbers.Number):
+                        raise RuntimeError('The init condition must be a number. Try str, float')
+                    getattr(self, f'_{built_in_data_types[data_type][0]}').add(key)
+                    self._init_conditions[key] = val
+            else:
+                raise RuntimeError(f'{built_in_data_types[data_type][1]} data not supported. Try dict[str]=float')
+        elif len(args) == 2:
+            name = args[0]
+            init_condition = args[1]
+
+            if not isinstance(init_condition, numbers.Number):
+                raise RuntimeError('The second argument must be a number. Try str, float')
+
+            if isinstance(name, six.string_types):
+                getattr(self, f'_{built_in_data_types[data_type][0]}').add(name)
+                self._init_conditions[name] = init_condition
+            else:
+                raise RuntimeError(f'{built_in_data_types[data_type][1]} data not supported. Try str, float')
+        else:
+            raise RuntimeError(f'{built_in_data_types[data_type][1]} data not supported. Try str, float')
+
+        return None
+
+
     def add_mixture_component(self, *args):
         """Add a component (reactive or product) to the model.
 
-        This method will keep track of the number of components in the model
-        It will hel creating the Z,C and S variables.
+        This is a wrapper for adding concentration state variables to the
+        template.
 
         Note:
             This method tries to mimic a template implmenetation. Depending
@@ -223,77 +431,132 @@ class TemplateBuilder(object):
             None
 
         """
-        if len(args) == 1:
-            input = args[0]
-            if isinstance(input, dict):
-                for key, val in input.items():
-                    if not isinstance(val, numbers.Number):
-                        raise RuntimeError('The init condition must be a number. Try str, float')
-                    self._component_names.add(key)
-                    self._init_conditions[key] = val
-            else:
-                raise RuntimeError('Mixture component data not supported. Try dict[str]=float')
-        elif len(args) == 2:
-            name = args[0]
-            init_condition = args[1]
+        self._add_state_variable(*args, data_type='concentration')
+        
+        return None
+    
+    def add_complementary_state_variable(self, *args):
+        """Add an extra state variable to the model.
 
-            if not isinstance(init_condition, numbers.Number):
-                raise RuntimeError('The second argument must be a number. Try str, float')
+        This is a wrapper for adding complementary state variables to the
+        template.
 
-            if isinstance(name, six.string_types):
-                self._component_names.add(name)
-                self._init_conditions[name] = init_condition
-            else:
-                raise RuntimeError('Mixture component data not supported. Try str, float')
-        else:
-            raise RuntimeError('Mixture component data not supported. Try str, float')
+        Note:
+            This method tries to mimic a template implmenetation. Depending
+            on the argument type it will behave differently
 
-    def add_spectral_data(self, data):
-        """Add spectral data
+            Planning on changing this method to add variables in a pyomo fashion
 
         Args:
-            data (DataFrame): DataFrame with measurement times as
-                              indices and wavelengths as columns.
+            param1 (str): variable name
+
+            param2 (float): initial condition
+
+            param1 (dict): Map component name(s) to initial condition value(s)
 
         Returns:
             None
 
         """
+        self._add_state_variable(*args, data_type='complementary_states')
+        
+        return None
+    
+
+    def _add_state_data(self, data, data_type, label=None):
+        """Generic method for adding data (concentration or complementary 
+        state data) - uses the measured data attribute to process
+        
+        Args:
+            data (DataFrame): DataFrame with measurement times as
+                              indices and concentrations as columns.
+                              
+            data_type (str): The name of the attribute for where the data is to
+                be stored.
+                
+            label (str): The label used to descibe the data in the pyomo model
+                index.
+
+        Returns:
+            None
+
+        """
+        built_in_data_types = {
+            'concentration' : 'C',
+            'complementary_states' : 'U',
+            'spectral' : 'D',
+            'huplc' : 'Dhat',
+            'smoothparam' : 'Ps',
+            }
+        
+        state_data = ['C', 'U']
+        deriv_data = ['C', 'U', 'D', 'Dhat']
+        
+        if label is None:
+            try:
+                label = built_in_data_types[data_type]
+            except:
+                raise ValueError("You need to provide a label for custom data types")
+        
         if isinstance(data, pd.DataFrame):
-            # add zero rows for feed times that are not in original measurements in D-matrix (CS):
-            df = pd.DataFrame(index=self._feed_times, columns=data.columns)
+            dfc = pd.DataFrame(index=self._feed_times, columns=data.columns)
             for t in self._feed_times:
-                if t not in data.index:  # for points that are the same in original measurement times and feed times (CS)
-                    df.loc[t] = [0.0 for n in range(len(data.columns))]
-            dfall = data.append(df)
-            dfall.sort_index(inplace=True)
-            dfall.index = dfall.index.to_series().apply(lambda x: np.round(x, 6))  # time from data rounded to 6 digits
-            ##############Filter out NaN############### points that are the same in original measurement times and feed times (CS)
+                if t not in data.index:
+                    dfc.loc[t] = [0.0 for n in range(len(data.columns))]
+                    
+            dfallc = data.append(dfc)
+            dfallc.sort_index(inplace=True)
+            dfallc.index = dfallc.index.to_series().apply(
+                lambda x: np.round(x, 6))
+
             count = 0
-            for j in dfall.index:
-                if count >= 1 and count < len(dfall.index):
-                    if dfall.index[count] == dfall.index[count - 1]:
-                        dfall = dfall.dropna()
+            for j in dfallc.index:
+                if count >= 1 and count < len(dfallc.index):
+                    if dfallc.index[count] == dfallc.index[count - 1]:
+                        dfallc = dfallc.dropna()
+                        
                 count += 1
-            ###########################################
-            self._spectral_data = dfall
+
+            setattr(self, f'_{data_type}_data', dfallc)
+            if label in state_data:
+                self._all_state_data += list(data.columns)
         else:
-            raise RuntimeError('Spectral data format not supported. Try pandas.DataFrame')
+            raise RuntimeError(f'{data_type.capitalize} data format not supported. Try pandas.DataFrame')
+        
+        if label in deriv_data:
+            C = np.array(dfallc)
+            for t in range(len(dfallc.index)):
+                for l in range(len(dfallc.columns)):
+                    if C[t, l] >= 0:
+                        pass
+                    else:
+                        setattr(self, f'_is_{label}_deriv', True)
+                        #self._is_C_deriv = True
+            if getattr(self, f'_is_{label}_deriv') == True:
+                print(
+                    "Warning! Since {label}-matrix contains negative values Kipet is assuming a derivative of {label} has been inputted")
 
-        D = np.array(dfall)
-
-        for t in range(len(dfall.index)):
-            for l in range(len(dfall.columns)):
-                if D[t, l] >= 0:
-                    pass
-                else:
-                    self._is_D_deriv = True
-        if self._is_D_deriv == True:
-            print(
-                "Warning! Since D-matrix contains negative values Kipet is assuming a derivative of D has been inputted")
-
+        return None
+    
+    def add_experimental_data(self, data):
+        """Generic function to add all data at once if in the same dataframe.
+        At the moment this works for concentration and complementary states
+        """
+        
+        exp_data = pd.DataFrame(data)
+     
+        conc_state_headers = self._component_names & set(exp_data.columns)
+        if len(conc_state_headers) > 0:
+            self.add_concentration_data(pd.DataFrame(exp_data[conc_state_headers].dropna()))
+        
+        comp_state_headers = self._complementary_states & set(exp_data.columns)
+        if len(comp_state_headers) > 0:
+            self.add_complementary_states_data(pd.DataFrame(exp_data[comp_state_headers].dropna()))
+        
+        return None
+        
     def add_concentration_data(self, data):
-        """Add concentration data
+        """Add concentration data as a wrapper to _add_state_data
 
         Args:
             data (DataFrame): DataFrame with measurement times as
@@ -303,36 +566,67 @@ class TemplateBuilder(object):
             None
 
         """
-        if isinstance(data, pd.DataFrame):
-            dfc = pd.DataFrame(index=self._feed_times, columns=data.columns)
-            for t in self._feed_times:
-                if t not in data.index:  # for points that are the same in original meas times and feed times
-                    dfc.loc[t] = [0.0 for n in range(len(data.columns))]
-            dfallc = data.append(dfc)
-            dfallc.sort_index(inplace=True)
-            dfallc.index = dfallc.index.to_series().apply(
-                lambda x: np.round(x, 6))  # time from data rounded to 6 digits
-            ##############Filter out NaN###############
-            count = 0
-            for j in dfallc.index:
-                if count >= 1 and count < len(dfallc.index):
-                    if dfallc.index[count] == dfallc.index[count - 1]:
-                        dfallc = dfallc.dropna()
-                count += 1
-            ###########################################
-            self._concentration_data = dfallc
-        else:
-            raise RuntimeError('Concentration data format not supported. Try pandas.DataFrame')
-        C = np.array(dfallc)
-        for t in range(len(dfallc.index)):
-            for l in range(len(dfallc.columns)):
-                if C[t, l] >= 0:
-                    pass
-                else:
-                    self._is_C_deriv = True
-        if self._is_C_deriv == True:
-            print(
-                "Warning! Since C-matrix contains negative values Kipet is assuming a derivative of C has been inputted")
+        self._add_state_data(data,
+                             data_type='concentration')
+        
+        return None
+        
+    def add_complementary_states_data(self, data):
+        """Add complementary state data as a wrapper to _add_state_data
+
+        Args:
+            data (DataFrame): DataFrame with measurement times as
+                              indices and complmentary states as columns.
+
+        Returns:
+            None
+
+        """
+        self._add_state_data(data,
+                             data_type='complementary_states')
+                           
+        return None
+    
+    def add_spectral_data(self, data):
+        """Add spectral data as a wrapper to _add_state_data
+
+        Args:
+            data (DataFrame): DataFrame with measurement times as
+                              indices and wavelengths as columns.
+
+        Returns:
+            None
+
+        """
+        self._add_state_data(data,
+                             data_type='spectral')
+        
+    def add_huplc_data(self, data): #added for the inclusion of h/uplc data CS
+        """Add HPLC or UPLC data as a wrapper to _add_state_data
+
+                Args:
+                    data (DataFrame): DataFrame with measurement times as
+                                      indices and wavelengths as columns.
+
+                Returns:
+                    None
+        """
+        self._add_state_data(data,
+                             data_type='huplc')
+
+    def add_smoothparam_data(self, data): #added for mutable smoothing parameter option CS
+        """Add smoothing parameters as a wrapper to _add_state_data
+
+                Args:
+                    data (DataFrame): DataFrame with measurement times as
+                                      indices and wavelengths as columns.
+
+                Returns:
+                    None
+        """
+        self._add_state_data(data,
+                             data_type='smoothparam')
+
 
     def add_absorption_data(self, data):
         """Add absorption data
@@ -379,59 +673,25 @@ class TemplateBuilder(object):
 
         """
         for t in times:
-            t = round(t,
-                      6)  # for added ones when generating data otherwise too many digits due to different data types CS
+            t = round(t,6)  # for added ones when generating data otherwise too many digits due to different data types CS
             self._meas_times.add(t)
 
-    def add_complementary_state_variable(self, *args):
-        """Add an extra state variable to the model.
-
-        This method add new state variables to the model. Extra or complementary states because
-        concentrations are also state variables
-
-        Note:
-            This method tries to mimic a template implmenetation. Depending
-            on the argument type it will behave differently
-
-            Planning on changing this method to add variables in a pyomo fashion
+    # Why is this function here?
+    def add_huplcmeasurement_times(self, times): #added for additional huplc times that are on a different time scale CS
+        """Add H/UPLC measurement times to the model
 
         Args:
-            param1 (str): variable name
-
-            param2 (float): initial condition
-
-            param1 (dict): Map component name(s) to initial condition value(s)
+            times (array_like): measurement points
 
         Returns:
             None
 
         """
-        if len(args) == 1:
-            input = args[0]
-            if isinstance(input, dict):
-                for key, val in input.items():
-                    if not isinstance(val, numbers.Number):
-                        raise RuntimeError('The init condition must be a number. Try str, float')
-                    self._complementary_states.add(key)
-                    self._init_conditions[key] = val
-            else:
-                raise RuntimeError('Complementary state data not supported. Try dict[str]=float')
-        elif len(args) == 2:
-            name = args[0]
-            init_condition = args[1]
+        for t in times:
+            t = round(t,6)  # for added ones when generating data otherwise too many digits due to different data types CS
+            self._huplcmeas_times.add(t)
 
-            if not isinstance(init_condition, numbers.Number):
-                raise RuntimeError('The second argument must be a number. Try str, float')
-
-            if isinstance(name, six.string_types):
-                self._complementary_states.add(name)
-                self._init_conditions[name] = init_condition
-            else:
-                raise RuntimeError('Complementary state data not supported. Try str, float')
-        else:
-            # print(len(args))
-            raise RuntimeError('Complementary state data not supported. Try str, float')
-
+            
     def add_algebraic_variable(self, *args, **kwds):
         """Add an algebraic variable to the model
 
@@ -447,7 +707,6 @@ class TemplateBuilder(object):
             None
 
         """
-
         bounds = kwds.pop('bounds', None)
 
         if len(args) == 1:
@@ -467,6 +726,21 @@ class TemplateBuilder(object):
             else:
                 raise RuntimeError('To add an algebraic please pass name')
 
+    # read bounds and initialize for qr and g (unwanted contri variables) from users KH.L
+    def add_qr_bounds_init(self, **kwds):
+        bounds = kwds.pop('bounds', None)
+        init = kwds.pop('init', None)
+        
+        self._qr_bounds = bounds
+        self._qr_init = init
+        
+    def add_g_bounds_init(self, **kwds):
+        bounds = kwds.pop('bounds', None)
+        init = kwds.pop('init', None)
+        
+        self._g_bounds = bounds
+        self._g_init = init
+    
     def set_odes_rule(self, rule):
         """Set the ode expressions.
 
@@ -517,16 +791,16 @@ class TemplateBuilder(object):
         if not isinstance(var, str):
             raise RuntimeError('var argument needs to be type string')
 
-        if var != 'S' and var != 'C':
-            raise RuntimeError('var argument needs to be either C, or S')
+        if var not in ['C', 'U', 'S']:
+            raise RuntimeError('var argument needs to be either C, U, or S')
 
-        if comp:
+        if comp is not None:
             if not isinstance(comp, str):
                 raise RuntimeError('comp argument needs to be type string')
             if comp not in self._component_names:
                 raise RuntimeError('comp needs to be one of the components')
 
-        if profile_range:
+        if profile_range is not None:
             if not isinstance(profile_range, tuple):
                 raise RuntimeError('profile_range needs to be a tuple')
                 if profile_range[0] > profile_range[1]:
@@ -540,7 +814,7 @@ class TemplateBuilder(object):
     def _validate_data(self, model, start_time, end_time):
         """Verify all inputs to the model make sense.
 
-        This method is not suppose to be use by users. Only for developers use
+        This method is not suppose to be used by users. Only for developers use
 
         Args:
             model (pyomo or casadi model): Model
@@ -580,7 +854,7 @@ class TemplateBuilder(object):
             if not self._meas_times:
                 raise RuntimeError('Need to add measurement times')
 
-    def create_pyomo_model(self, start_time, end_time):
+    def create_pyomo_model(self, start_time=None, end_time=None, parameter_normalization=False):
         """Create a pyomo model.
 
         This method is the core method for further simulation or optimization studies
@@ -594,6 +868,17 @@ class TemplateBuilder(object):
             Pyomo ConcreteModel
 
         """
+        if self._times is not None:
+            if start_time is None:
+                start_time = self._times[0]
+            if end_time is None:
+                end_time = self._times[1]
+        else:
+            if start_time is None:
+                raise ValueError('A start time must be provided')
+            if end_time is None:
+                raise ValueError('An end time must be provided')
+        
         # Model
         pyomo_model = ConcreteModel()
 
@@ -602,22 +887,40 @@ class TemplateBuilder(object):
         pyomo_model.parameter_names = Set(initialize=self._parameters.keys())
         pyomo_model.complementary_states = Set(initialize=self._complementary_states)
         pyomo_model.states = pyomo_model.mixture_components | pyomo_model.complementary_states
-
         pyomo_model.algebraics = Set(initialize=self._algebraics.keys())
 
+        # New Set for actual data inputs
+        pyomo_model.measured_data = Set(initialize=self._all_state_data)
+        # Make constants that are equal to the initial guess and set params to 1
+        
         list_times = self._meas_times
         m_times = sorted(list_times)
         list_feedtimes = self._feed_times  # For inclusion of discrete feeds CS
         feed_times = sorted(list_feedtimes)  # For inclusion of discrete feeds CS
         m_lambdas = list()
+        m_alltimes = m_times
+        conc_times = list()
+
+        if self._smoothparam_data is not None:#added for optional smoothing parameter values (mutable) read from file CS
+            pyomo_model.smoothparameter_names = Set(initialize=self._smoothparameters.keys()) #added for mutable parameters
+            pyomo_model.smooth_param_datatimes = Set(initialize=sorted(self._smoothparam_data.index))
+            help_dict=dict()
+            for k in self._smoothparam_data.index:
+                for j in self._smoothparam_data.columns:
+                    help_dict[k, j]=float(self._smoothparam_data[j][k])
+            pyomo_model.smooth_param_data = Param(self._smoothparam_data.index, sorted(self._smoothparam_data.columns), initialize=help_dict)
+
         if self._spectral_data is not None and self._absorption_data is not None:
             raise RuntimeError('Either add absorption data or spectral data but not both')
 
-        if self._spectral_data is not None:
+        # I don't know why m_times is changed for each of these - what if there are more than one?
+
+        if self._spectral_data is not None and self._huplc_data is None:
             list_times = list_times.union(set(self._spectral_data.index))
             list_lambdas = list(self._spectral_data.columns)
             m_times = sorted(list_times)
             m_lambdas = sorted(list_lambdas)
+            m_alltimes=m_times
 
         if self._absorption_data is not None:
             if not self._meas_times:
@@ -631,65 +934,219 @@ class TemplateBuilder(object):
             list_times = list_times.union(set(self._concentration_data.index))
             list_concs = list(self._concentration_data.columns)
             m_times = sorted(list_times)
+            conc_times = sorted(list_times)
+            m_alltimes = sorted(list_times)#has to be changed for including huplc data with conc data!
             m_concs = sorted(list_concs)
 
-        if m_times:
-            if m_times[0] < start_time:
-                raise RuntimeError('Measurement time {0} not within ({1},{2})'.format(m_times[0], start_time, end_time))
-            if m_times[-1] > end_time:
+        # New complementary state data KM - This should only be T
+        if self._complementary_states_data is not None:
+            list_times = list_times.union(set(self._complementary_states_data.index))
+            list_comps = list(self._complementary_states_data.columns)
+            m_times = sorted(list_times)
+            m_alltimes = sorted(list_times)
+            m_comps = sorted(list_comps)
+
+
+        #For inclusion of h/uplc data:
+        if self._huplc_data is not None and self._spectral_data is None: #added for additional H/UPLC data (CS)
+            list_huplctimes = self._huplcmeas_times
+            list_huplctimes = list_huplctimes.union(set(self._huplc_data.index))
+            list_conDhats = list(self._huplc_data.columns)
+            m_huplctimes = sorted(list_huplctimes)
+
+        if self._huplc_data is not None and self._spectral_data is not None:
+            list_times = list_times.union(set(self._spectral_data.index))
+            list_lambdas = list(self._spectral_data.columns)
+            m_times = sorted(list_times)
+            m_lambdas = sorted(list_lambdas)
+            list_huplctimes = self._huplcmeas_times
+            list_huplctimes = list_huplctimes.union(set(self._huplc_data.index))
+            list_conDhats = list(self._huplc_data.columns)
+            m_huplctimes = sorted(list_huplctimes)
+            list_alltimes = list_times.union(list_huplctimes)
+            m_alltimes = sorted(list_alltimes)
+
+        #added for optional smoothing CS:
+        if self._smoothparam_data is not None:
+            if self._huplc_data is not None and self._spectral_data is not None:
+                list_alltimes = list_times.union(list_huplctimes)
+                m_alltimes = sorted(list_alltimes)
+                list_alltimessmooth = list_alltimes.union(set(self._smoothparam_data.index))
+                m_allsmoothtimes = sorted(list_alltimessmooth)
+            else:
+                list_timessmooth = list_times.union(set(self._smoothparam_data.index))
+                m_alltimes = m_times
+                m_allsmoothtimes = sorted(list_timessmooth)
+
+        if self._huplc_data is not None:
+            if m_huplctimes:
+                if m_huplctimes[0] < start_time:
+                    raise RuntimeError(
+                        'Measurement time {0} not within ({1},{2})'.format(m_huplctimes[0], start_time, end_time))
+                if m_huplctimes[-1] > end_time:
+                    raise RuntimeError(
+                        'Measurement time {0} not within ({1},{2})'.format(m_huplctimes[-1], start_time, end_time))
+
+        if self._smoothparam_data is not None:
+            if m_allsmoothtimes:
+                if m_allsmoothtimes[0] < start_time:
+                    raise RuntimeError(
+                        'Measurement time {0} not within ({1},{2})'.format(m_allsmoothtimes[0], start_time, end_time))
+                if m_allsmoothtimes[-1] > end_time:
+                    raise RuntimeError(
+                        'Measurement time {0} not within ({1},{2})'.format(m_allsmoothtimes[-1], start_time, end_time))
+
+            pyomo_model.allsmooth_times = Set(initialize=m_allsmoothtimes, ordered=True)
+
+        # Add given state standard deviations to the pyomo model
+        if self._state_sigmas is not None:
+            
+            state_sigmas = {k: v for k, v in self._state_sigmas.items() if k in pyomo_model.measured_data}
+            pyomo_model.sigma = Param(pyomo_model.measured_data, initialize=state_sigmas)
+        else:
+            pyomo_model.sigma = Param(pyomo_model.measured_data, initialize=1)
+        
+        if self._scale_parameters:
+            pyomo_model.K = Param(pyomo_model.parameter_names, 
+                                  initialize=self._parameters_init,
+                                  mutable=True,
+                                  default=1)
+
+        if m_alltimes:
+            if m_alltimes[0] < start_time:
+                raise RuntimeError('Measurement time {0} not within ({1},{2})'.format(m_alltimes[0], start_time, end_time))
+            if m_alltimes[-1] > end_time:
                 raise RuntimeError(
-                    'Measurement time {0} not within ({1},{2})'.format(m_times[-1], start_time, end_time))
+                    'Measurement time {0} not within ({1},{2})'.format(m_alltimes[-1], start_time, end_time))
+
         self._m_lambdas = m_lambdas
+
         # For inclusion of discrete feeds CS
         if self._feed_times is not None:
             list_feedtimes = list(self._feed_times)
             feed_times = sorted(list_feedtimes)
 
+        if self._huplc_data is not None:#added for addition huplc data CS
+            pyomo_model.huplcmeas_times = Set(initialize=m_huplctimes, ordered=True)
+            pyomo_model.huplctime = ContinuousSet(initialize=pyomo_model.huplcmeas_times,
+                                                  bounds=(start_time, end_time))
+            
+        # all of these times are confusing - must it be this way?
+        pyomo_model.allmeas_times = Set(initialize=m_alltimes, ordered=True) #add for new data structure CS
         pyomo_model.meas_times = Set(initialize=m_times, ordered=True)
         pyomo_model.feed_times = Set(initialize=feed_times, ordered=True)  # For inclusion of discrete feeds CS
         pyomo_model.meas_lambdas = Set(initialize=m_lambdas, ordered=True)
-
-        pyomo_model.time = ContinuousSet(initialize=pyomo_model.meas_times,
-                                         bounds=(start_time, end_time))
+        
+        pyomo_model.alltime = ContinuousSet(initialize=pyomo_model.allmeas_times,
+                                         bounds=(start_time, end_time)) #add for new data structure CS
 
         # Parameters
+        
         pyomo_model.init_conditions = Param(pyomo_model.states,
-                                            initialize=self._init_conditions, mutable=True)
+                                            initialize=self._init_conditions,
+                                            mutable=True)
         pyomo_model.start_time = Param(initialize=start_time)
         pyomo_model.end_time = Param(initialize=end_time)
 
+        ######################################################################
         # Variables
-        pyomo_model.Z = Var(pyomo_model.time,
-                            pyomo_model.mixture_components,
-                            # bounds=(0.0,None),
-                            initialize=1)
+        ######################################################################
+        
+        # Declaration and initialization of predicted concentrations and states
+        
+        model_pred_var_name = {
+                'Z' : pyomo_model.mixture_components,
+                'X' : pyomo_model.complementary_states,
+                    }
+        
+        for var, model_set in model_pred_var_name.items():
+        
+            setattr(pyomo_model, var, Var(pyomo_model.alltime,
+                                          model_set,
+                                          # bounds=(0.0,None),
+                                          initialize=1) 
+                    )    
+        
+            for time, comp in getattr(pyomo_model, var):
+                if time == pyomo_model.start_time.value:
+                    getattr(pyomo_model, var)[time, comp].value = self._init_conditions[comp]
+                   
+            setattr(pyomo_model, f'd{var}dt', DerivativeVar(getattr(pyomo_model, var),
+                                                            wrt=pyomo_model.alltime)
+                    )
+                   
+        # Variables of provided data - set as fixed variables complementary to above
+        
+        fixed_var_name = {
+                'C' : self._concentration_data,
+                'U' : self._complementary_states_data,
+                    }
+        
+        for var, data in fixed_var_name.items():
+            c_dict = dict()
+            if getattr(self, f'_is_{var}_deriv') == True:
+                c_bounds = (None, None)
+            else:
+                c_bounds = (0.0, None)
+    
+            if data is not None:    
+                for i, row in data.iterrows():
+                    c_dict.update({(i, col): float(row[col]) for col in data.columns})
+                
+                setattr(pyomo_model, f'{var}_indx', Set(initialize=c_dict.keys(), ordered=True))
+                setattr(pyomo_model, var, Var(getattr(pyomo_model, f'{var}_indx'),
+                                              bounds=c_bounds,
+                                              initialize=c_dict,
+                                              )
+                        )
+                
+                for k, v in getattr(pyomo_model, var).items():
+                    getattr(pyomo_model, var)[k].fixed = True
+            
+            else:
+                setattr(pyomo_model, var, Var(pyomo_model.allmeas_times,
+                                pyomo_model.mixture_components,
+                                bounds=c_bounds,
+                                initialize=1))
+    
+                for time, comp in getattr(pyomo_model, var):
+                    if time == pyomo_model.start_time.value:
+                        print(f'initial values: {time}, {comp}')
+                        getattr(pyomo_model, var)[time, comp].value = self._init_conditions[comp]
 
-        for t, s in pyomo_model.Z:
-            if t == pyomo_model.start_time.value:
-                pyomo_model.Z[t, s].value = self._init_conditions[s]
-                # pyomo_model.Z[t, s].fixed = True
-
-        pyomo_model.dZdt = DerivativeVar(pyomo_model.Z,
-                                         wrt=pyomo_model.time)
-
+        # End intialization for C and U
+        
+        
+        ######################################################################
+        # Parameters
+        ######################################################################
+    
         p_dict = dict()
-        for p, v in self._parameters.items():
-            if v is not None:
-                p_dict[p] = v
+        for param, init_value in self._parameters.items():
+            if init_value is not None and init_value is not pd.DataFrame:
+                p_dict[param] = init_value
 
             # added for option of providing initial guesses CS:
-            elif p in self._parameters_init.keys():
-                for p, l in self._parameters_init.items():
-                    p_dict[p] = l
+            elif param in self._parameters_init.keys():
+                p_dict[param] = self._parameters_init[param]
+                #for param, init_value in self._parameters_init.items():
+                    #p_dict[p] = init_value
             else:
-                for p, s in self._parameters_bounds.items():
-                    lb = s[0]
-                    ub = s[1]
-                    p_dict[p] = (ub - lb) / 2
+                for param, bounds in self._parameters_bounds.items():
+                    lb = bounds[0]
+                    ub = bounds[1]
+                    p_dict[param] = (ub - lb) / 2 + lb
 
-        pyomo_model.P = Var(pyomo_model.parameter_names,
+        if self._scale_parameters:
+            pyomo_model.P = Var(pyomo_model.parameter_names,
+                            bounds = (0.1, 10),
+                            initialize=1)
+
+        else:
+            pyomo_model.P = Var(pyomo_model.parameter_names,
                             # bounds = (0.0,None),
                             initialize=p_dict)
+
         # set bounds P
         for k, v in self._parameters_bounds.items():
             lb = v[0]
@@ -697,78 +1154,67 @@ class TemplateBuilder(object):
             pyomo_model.P[k].setlb(lb)
             pyomo_model.P[k].setub(ub)
 
-        if self._concentration_data is not None:
-            c_dict = dict()
-            for k in self._concentration_data.columns:
-                for c in self._concentration_data.index:
-                    c_dict[c, k] = float(self._concentration_data[k][c])
-        else:
-            c_dict = 1.0
+        if self._estim_init==True:#added for the estimation of initial conditions which have to be complementary state vars CS
+            pyomo_model.initparameter_names = Set(initialize=self._initextraest)
+            # pyomo_model.initparameter_names.pprint()
+            pyomo_model.add_component('initextraparams', Set(initialize=self._initextraest))
+            pinit_dict = dict()
+            for p, v in self._initextraparams.items():
+                if v is not None and v is not pd.DataFrame:
+                    pinit_dict[p] = v
 
-        if self._is_C_deriv == True:
-            c_bounds = (None, None)
-        else:
-            c_bounds = (0.0, None)
+                # added for option of providing initial guesses CS:
+                elif p in self._initextraparams_init.keys():
+                    for p, l in self._initextraparams_init.items():
+                        pinit_dict[p] = l
+                else:
+                    for p, s in self._initextraparams_bounds.items():
+                        lb = s[0]
+                        ub = s[1]
+                        pinit_dict[p] = (ub - lb) / 2
+            pyomo_model.Pinit = Var(pyomo_model.initparameter_names,initialize=pinit_dict)
 
-        pyomo_model.C = Var(pyomo_model.meas_times,
-                            pyomo_model.mixture_components,
-                            bounds=c_bounds,
-                            initialize=c_dict)
+            for k, v in self._initextraparams_bounds.items():
+                lb = v[0]
+                ub = v[1]
+                pyomo_model.Pinit[k].setlb(lb)
+                pyomo_model.Pinit[k].setub(ub)
+            for k in pyomo_model.initparameter_names:
+                pyomo_model.Pinit[k].fixed = True #Just added for bound etc functionalities, variable is init_conditions
+                # but Pinit is set to the value after solution of the parameter estimation problem CS
 
-        if self._concentration_data is not None:
-            for t in pyomo_model.meas_times:
-                for k in pyomo_model.mixture_components:
-                    pyomo_model.C[t, k].fixed = True
+        #for optional smoothing parameters (CS):
+        if isinstance(self._smoothparameters, dict) and self._smoothparam_data is not None:
+            ps_dict = dict()
+            for k in self._smoothparam_data.columns:
+                for c in pyomo_model.allsmooth_times:
+                    ps_dict[c, k] = float(self._smoothparam_data[k][c])
 
-        else:
-            for t, c in pyomo_model.C:
-                if t == pyomo_model.start_time.value:
-                    pyomo_model.C[t, c].value = self._init_conditions[c]
+            ps_dict2 = dict()
+            for p in self._smoothparameters.keys():
+                for t in pyomo_model.alltime:
+                    if t in pyomo_model.allsmooth_times:
+                        ps_dict2[t, p] = float(ps_dict[t, p])
+                    else:
+                        ps_dict2[t, p] = 0.0
 
-        # This section provides bounds if user used bound_profile (MS)
-        for i in self._prof_bounds:
-            if i[0] == 'C':
-                for t, c in pyomo_model.C:
-                    if i[1] == c:
-                        if i[2]:
-                            if t >= i[2][0] and t < i[2][1]:
-                                pyomo_model.C[t, c].setlb(i[3][0])
-                                pyomo_model.C[t, c].setub(i[3][1])
-                        else:
-                            pyomo_model.C[t, c].setlb(i[3][0])
-                            pyomo_model.C[t, c].setub(i[3][1])
+            pyomo_model.Ps = Param(pyomo_model.alltime, pyomo_model.smoothparameter_names, initialize=ps_dict2, mutable=True, default=20.)#here just set to some value that is noc
 
-                    elif i[1] == None:
-                        if i[2]:
-                            if t >= i[2][0] and t < i[2][1]:
-                                pyomo_model.C[t, c].setlb(i[3][0])
-                                pyomo_model.C[t, c].setub(i[3][1])
-                        else:
-                            pyomo_model.C[t, c].setlb(i[3][0])
-                            pyomo_model.C[t, c].setub(i[3][1])
-
-        pyomo_model.X = Var(pyomo_model.time,
-                            pyomo_model.complementary_states,
-                            initialize=1.0)
-
-        # Fixes parameters that were given numeric values
-        for t, s in pyomo_model.X:
-            if t == pyomo_model.start_time.value:
-                pyomo_model.X[t, s].value = self._init_conditions[s]
-
-        pyomo_model.dXdt = DerivativeVar(pyomo_model.X,
-                                         wrt=pyomo_model.time)
-        pyomo_model.Y = Var(pyomo_model.time,
+        
+        
+        pyomo_model.Y = Var(pyomo_model.alltime,
                             pyomo_model.algebraics,
                             initialize=1.0)
 
         # Add optional bounds for algebraic variables (CS):
-        for t in pyomo_model.time:
+        for t in pyomo_model.alltime:
             for k, v in self._y_bounds.items():
                 lb = v[0]
                 ub = v[1]
                 pyomo_model.Y[t, k].setlb(lb)
                 pyomo_model.Y[t, k].setub(ub)
+
+        # Can this be handled as above?
 
         if self._absorption_data is not None:
             s_dict = dict()
@@ -790,15 +1236,61 @@ class TemplateBuilder(object):
                 pyomo_model.P[p].fixed = True
 
         # spectral data
-        if self._spectral_data is not None:
+        if self._spectral_data is not None: #changed for new data structure CS
             s_data_dict = dict()
             for t in pyomo_model.meas_times:
                 for l in pyomo_model.meas_lambdas:
-                    s_data_dict[t, l] = float(self._spectral_data[l][t])
+                    if t in pyomo_model.meas_times:
+                        s_data_dict[t, l] = float(self._spectral_data[l][t])
+                    else:
+                        s_data_dict[t, l] = float('nan') #missing time points are set to nan to filter out later
 
             pyomo_model.D = Param(pyomo_model.meas_times,
                                   pyomo_model.meas_lambdas,
                                   initialize=s_data_dict)
+        
+        # unwanted contributions: create variables qr and g KH.L
+        if self._qr_bounds is not None:
+            qr_bounds = self._qr_bounds
+        elif self._qr_bounds is None:
+            qr_bounds = None
+            
+        if self._qr_init is not None:
+            qr_init = self._qr_init
+        elif self._qr_init is None:
+            qr_init = 1.0
+            
+        pyomo_model.qr = Var(pyomo_model.alltime, bounds=qr_bounds, initialize=qr_init)
+        
+        
+        if self._g_bounds is not None:
+            g_bounds = self._g_bounds
+        elif self._g_bounds is None:
+            g_bounds = None
+            
+        if self._g_init is not None:
+            g_init = self._g_init
+        elif self._g_init is None:
+            g_init = 0.1
+            
+        pyomo_model.g = Var(pyomo_model.meas_lambdas, bounds=g_bounds, initialize=g_init)
+        
+        ####### Added for new add data CS:
+        if self._huplc_data is not None and self._is_huplc_abs_set:
+            self.set_huplc_absorbing_species(pyomo_model, self._huplc_absorbing, self._vol, self._solid_spec, check=False)
+
+            Dhat_dict = dict()
+            for k in self._huplc_data.columns:
+                for c in self._huplc_data.index:
+                    Dhat_dict[c, k] = float(self._huplc_data[k][c])
+
+        if self._is_Dhat_deriv == True:
+            Dhat_bounds = (None, None)
+        else:
+            Dhat_bounds = (0.0, None)
+            
+
+        ###########
 
         # validate the model before writing constraints
         self._validate_data(pyomo_model, start_time, end_time)
@@ -816,8 +1308,11 @@ class TemplateBuilder(object):
 
         # the generation of the constraints is not efficient but not critical
         if self._odes:
+            
             def rule_odes(m, t, k):
                 exprs = self._odes(m, t)
+            
+                ### Test Area End ###
                 if t == m.start_time.value:
                     return Constraint.Skip
                 else:
@@ -832,7 +1327,7 @@ class TemplateBuilder(object):
                         else:
                             return Constraint.Skip
 
-            pyomo_model.odes = Constraint(pyomo_model.time,
+            pyomo_model.odes = Constraint(pyomo_model.alltime,
                                           pyomo_model.states,
                                           rule=rule_odes)
 
@@ -844,7 +1339,7 @@ class TemplateBuilder(object):
                 alg_const = self._algebraic_constraints(m, t)[k]
                 return alg_const == 0.0
 
-            pyomo_model.algebraic_consts = Constraint(pyomo_model.time,
+            pyomo_model.algebraic_consts = Constraint(pyomo_model.alltime,
                                                       range(n_alg_eqns),
                                                       rule=rule_algebraics)
         #######################
@@ -867,38 +1362,75 @@ class TemplateBuilder(object):
                 for k in pyomo_model.mixture_components:
                     pyomo_model.S[l, k].fixed = True
 
+        
+        # Iterate throught the component variables and apply the bounds to
+        # the speicifc time period provided
+        for bound_set in self._prof_bounds:
+            # Why would I set bounds on only S, U, or C - these are fixed, right?
+            var = bound_set[0]
+            component_name = bound_set[1]
+            if bound_set[2] is not None:
+                bound_time_start = bound_set[2][0]
+                bound_time_end = bound_set[2][1]
+            upper_bound = bound_set[3][1]
+            lower_bound = bound_set[3][0]
+            # if var == 'C':
+            #     var = 'Z'
+            #print(f'for {var}')
+            
+            for time, comp in getattr(pyomo_model, var):
+                if component_name == comp or component_name is None:
+                    if bound_set[2] is not None:
+                        if time >= bound_time_start and time < bound_time_end:
+                            getattr(pyomo_model, var)[time, comp].setlb(lower_bound)
+                            getattr(pyomo_model, var)[time, comp].setub(upper_bound)
+                    else:
+                        getattr(pyomo_model, var)[time, comp].setlb(lower_bound)
+                        getattr(pyomo_model, var)[time, comp].setub(upper_bound)
+
+        ### Original replaced by above
         # This section provides bounds if user used bound_profile (MS)
-        for i in self._prof_bounds:
-            if i[0] == 'S':
-                for l, c in pyomo_model.S:
-                    if i[1] == c:
-                        if i[2]:
-                            if l >= i[2][0] and l < i[2][1]:
-                                pyomo_model.S[l, c].setlb(i[3][0])
-                                pyomo_model.S[l, c].setub(i[3][1])
-                        else:
-                            pyomo_model.S[l, c].setlb(i[3][0])
-                            pyomo_model.S[l, c].setub(i[3][1])
+        # for i in self._prof_bounds:
+        #     if i[0] == 'C':
+        #         for t, c in pyomo_model.C:
+        #             if i[1] == c:
+        #                 if i[2]:
+        #                     if t >= i[2][0] and t < i[2][1]:
+        #                         pyomo_model.C[t, c].setlb(i[3][0])
+        #                         pyomo_model.C[t, c].setub(i[3][1])
+        #                 else:
+        #                     pyomo_model.C[t, c].setlb(i[3][0])
+        #                     pyomo_model.C[t, c].setub(i[3][1])
 
-                    elif i[1] == None:
-                        if i[2]:
-                            if l >= i[2][0] and l < i[2][1]:
-                                pyomo_model.S[l, c].setlb(i[3][0])
-                                pyomo_model.S[l, c].setub(i[3][1])
-                        else:
-                            pyomo_model.S[l, c].setlb(i[3][0])
-                            pyomo_model.S[l, c].setub(i[3][1])
+        #             elif i[1] == None:
+        #                 if i[2]:
+        #                     if t >= i[2][0] and t < i[2][1]:
+        #                         pyomo_model.C[t, c].setlb(i[3][0])
+        #                         pyomo_model.C[t, c].setub(i[3][1])
+        #                 else:
+        #                     pyomo_model.C[t, c].setlb(i[3][0])
+        #                     pyomo_model.C[t, c].setub(i[3][1])
+      
+        #: in case of a second call after known_absorbing has been declared
+        if self._is_known_abs_set:  
+            self.set_known_absorbing_species(pyomo_model,
+                                             self._known_absorbance,
+                                             self._known_absorbance_data,
+                                             check=False
+                                             )
+        
+        if self._estim_init:  #: in case of a second call after known_absorbing has been declared
+            self.set_estinit_extra_species(pyomo_model,
+                                           self._initextra_est_list,
+                                           check=False)
 
-        if self._is_known_abs_set:  #: in case of a second call after known_absorbing has been declared
-            self.set_known_absorbing_species(pyomo_model, self._known_absorbance, self._known_absorbance_data,
-                                             check=False)
 
         return pyomo_model
 
     def create_casadi_model(self, start_time, end_time):
         """Create a casadi model.
 
-        Casadi models are for simulation purpuses mainly
+        Casadi models are for simulation purposes mainly
 
         Args:
             start_time (float): initial time considered in the model
@@ -947,6 +1479,7 @@ class TemplateBuilder(object):
                         'Measurement time {0} not within ({1},{2})'.format(m_times[-1], start_time, end_time))
 
             casadi_model.meas_times = m_times
+            casadi_model.allmeas_times = m_times
             casadi_model.meas_lambdas = m_lambdas
 
             # Variables
@@ -954,7 +1487,7 @@ class TemplateBuilder(object):
             casadi_model.X = KipetCasadiStruct('X', list(casadi_model.complementary_states), dummy_index=True)
             casadi_model.Y = KipetCasadiStruct('Y', list(casadi_model.algebraics), dummy_index=True)
             casadi_model.P = KipetCasadiStruct('P', list(casadi_model.parameter_names))
-            casadi_model.C = KipetCasadiStruct('C', list(casadi_model.meas_times))
+            casadi_model.C = KipetCasadiStruct('C', list(casadi_model.allmeas_times))
             casadi_model.S = KipetCasadiStruct('S', list(casadi_model.meas_lambdas))
 
             if self._parameters_bounds:
@@ -1017,6 +1550,10 @@ class TemplateBuilder(object):
     def measurement_times(self):
         return self._meas_times
 
+    @property #added with additional data CS
+    def huplcmeasurement_times(self):
+        return self._huplcmeas_times
+
     @property
     def feed_times(self):
         return self._feed_times  # added for feeding points CS
@@ -1041,6 +1578,10 @@ class TemplateBuilder(object):
     def measurement_times(self):
         raise RuntimeError('Not supported')
 
+    @huplcmeasurement_times.setter
+    def huplcmeasurement_times(self):
+        raise RuntimeError('Not supported')
+
     @feed_times.setter
     def feed_times(self):
         raise RuntimeError('Not supported')  # added for feeding points CS
@@ -1054,6 +1595,7 @@ class TemplateBuilder(object):
     def has_concentration_data(self):
         return self._concentration_data is not None
 
+
     def optional_warmstart(self, model):
         if hasattr(model, 'dual') and hasattr(model, 'ipopt_zL_out') and hasattr(model, 'ipopt_zU_out') and hasattr(
                 model, 'ipopt_zL_in') and hasattr(model, 'ipopt_zU_in'):
@@ -1064,6 +1606,95 @@ class TemplateBuilder(object):
             model.ipopt_zU_out = Suffix(direction=Suffix.IMPORT)
             model.ipopt_zL_in = Suffix(direction=Suffix.EXPORT)
             model.ipopt_zU_in = Suffix(direction=Suffix.EXPORT)
+
+    def set_estinit_extra_species(self, model, initextra_est_list, check=True):#added for the estimation of initial conditions which have to be complementary state vars CS
+        # type: (ConcreteModel, list, bool) -> None
+        """Sets the non absorbing component of the model.
+
+        Args:
+            initextra_est_list: List of to be estimated initial conditions of complementary state variables.
+            model: The corresponding model.
+            check: Safeguard against setting this up twice.
+        """
+        if hasattr(model, 'estim_init'):
+            print("To be estimated initial conditions of complementary state variables were already set up before.")
+            return
+
+        if (self._initextra_est_list and check):
+            raise RuntimeError('To be estimated initial conditions of complementary state variables have been already set up.')
+
+        self._initextraest = initextra_est_list
+        self._estim_init = True
+        model.estim_init=Param(initialize=self._estim_init)
+
+    def add_init_extra(self, *args, **kwds):#added for the estimation of initial conditions which have to be complementary state vars CS
+        """Add a kinetic parameter(s) to the model.
+
+        Note:
+            Plan to change this method add parameters as PYOMO variables
+
+            This method tries to mimic a template implementation. Depending
+            on the argument type it will behave differently
+
+        Args:
+            param1 (str): Species name. Creates a variable species
+
+            param1 (list): Species names. Creates a list of variable species
+
+            param1 (dict): Map species name(s) to value(s). Creates a fixed parameter(s)
+
+        Returns:
+            None
+
+        """
+        bounds = kwds.pop('bounds', None)
+        init = kwds.pop('init', None)
+        self._estim_init=True
+
+        if len(args) == 1:
+            name = args[0]
+            if isinstance(name, six.string_types):
+                self._initextraparams[name] = None
+                if bounds is not None:
+                    self._initextraparams_bounds[name] = bounds
+                if init is not None:
+                    self._initextraparams_init[name] = init
+            elif isinstance(name, list) or isinstance(name, set):
+                if bounds is not None:
+                    if len(bounds) != len(name):
+                        raise RuntimeError('the list of bounds must be equal to the list of species')
+                for i, n in enumerate(name):
+                    self._initextraparams[n] = None
+                    if bounds is not None:
+                        self._initextraparams_bounds[n] = bounds[i]
+                    if init is not None:
+                        self._initextraparams_init[n] = init[i]
+            elif isinstance(name, dict):
+                if bounds is not None:
+                    if len(bounds) != len(name):
+                        raise RuntimeError('the list of bounds must be equal to the list of species')
+                for k, v in name.items():
+                    self._initextraparams[k] = v
+                    if bounds is not None:
+                        self._initextraparams_bounds[k] = bounds[k]
+                        print(bounds[k])
+                    if init is not None:
+                        self._initextraparams_init[k] = init[k]
+            else:
+                raise RuntimeError('Species data not supported. Try str')
+        elif len(args) == 2:
+            first = args[0]
+            second = args[1]
+            if isinstance(first, six.string_types):
+                self._initextraparams[first] = second
+                if bounds is not None:
+                    self._initextraparams_bounds[first] = bounds
+                if init is not None:
+                    self._initextraparams_init[first] = init
+            else:
+                raise RuntimeError('Species argument not supported. Try str,val')
+        else:
+            raise RuntimeError('Species argument not supported. Try str,val')
 
     def set_non_absorbing_species(self, model, non_abs_list, check=True):
         # type: (ConcreteModel, list, bool) -> None
@@ -1089,6 +1720,7 @@ class TemplateBuilder(object):
         Z = getattr(model, 'Z')
 
         times = getattr(model, 'meas_times')
+        alltimes = getattr(model, 'allmeas_times')
         allcomps = getattr(model, 'mixture_components')
 
         model.add_component('fixed_C', ConstraintList())
@@ -1106,11 +1738,12 @@ class TemplateBuilder(object):
         model.add_component('matchCsC', ConstraintList())
         matchCsC_con = getattr(model, 'matchCsC')
 
-        for time in times:
-            for component in self._non_absorbing:
+        for time in alltimes:
+            for component in allcomps:
                 new_con.add(C[time, component] == Z[time, component])
             for componenta in abscomps:
-                matchCsC_con.add(Cs[time, componenta] == C[time, componenta])
+                if time in times:
+                    matchCsC_con.add(Cs[time, componenta] == C[time, componenta])
         ##########################
 
     def set_known_absorbing_species(self, model, known_abs_list, absorbance_data, check=True):
@@ -1137,10 +1770,77 @@ class TemplateBuilder(object):
         S = getattr(model, 'S')
         C = getattr(model, 'C')
         Z = getattr(model, 'Z')
-        times = getattr(model, 'meas_times')
         lambdas = getattr(model, 'meas_lambdas')
         model.known_absorbance_data = self._known_absorbance_data
         for component in self._known_absorbance:
             for l in lambdas:
                 S[l, component].set_value(self._known_absorbance_data[component][l])
                 S[l, component].fix()
+      #########################
+
+        #added for additional huplc data CS
+    def set_huplc_absorbing_species(self, model, huplc_abs_list, vol=None, solid_spec=None, check=True):
+        # type: (ConcreteModel, list, bool) -> None
+        """Sets the non absorbing component of the model.
+
+        Args:
+            huplc_abs_list: List of huplc absorbing components.
+            vol: reactor volume
+            solid_spec: solid species observed with huplc data
+            model: The corresponding model.
+            check: Safeguard against setting this up twice.
+        """
+        if hasattr(model, 'huplc_absorbing'):
+            print("huplc-absorbing species were already set up before.")
+            return
+
+        if (self._is_huplc_abs_set and check):
+            raise RuntimeError('huplc-absorbing species have been already set up.')
+
+
+        self._is_huplc_abs_set = True
+        self._vol=vol
+        model.add_component('vol', Param(initialize=self._vol))
+
+
+        self._huplc_absorbing = huplc_abs_list
+        model.add_component('huplc_absorbing', Set(initialize=self._huplc_absorbing))
+        alltime = getattr(model, 'alltime')
+        times = getattr(model, 'huplcmeas_times')
+        alltimes = getattr(model, 'allmeas_times')
+        timesh = getattr(model, 'huplctime')
+        alltime=getattr(model, 'alltime')
+        #########
+        model.add_component('huplcabs_components_names', Set())
+        huplcabscompsnames = [name for name in set(sorted(self._huplc_absorbing))]
+        model.add_component('huplcabs_components', Set(initialize=huplcabscompsnames))
+        huplcabscomps = getattr(model, 'huplcabs_components')
+
+        self._solid_spec=solid_spec
+        if solid_spec is not None:
+            solid_spec_arg1keys = [key for key in set(sorted(self._solid_spec.keys()))]
+            model.add_component('solid_spec_arg1', Set(initialize=solid_spec_arg1keys))
+            solid_spec_arg2keys = [key for key in set(sorted(self._solid_spec.values()))]
+            model.add_component('solid_spec_arg2', Set(initialize=solid_spec_arg2keys))
+            model.add_component('solid_spec', Var(model.solid_spec_arg1, model.solid_spec_arg2, initialize=self._solid_spec))
+
+        C = getattr(model, 'C')
+        Z = getattr(model, 'Z')
+
+        Dhat_dict=dict()
+        for k in self._huplc_data.columns:
+            for c in self._huplc_data.index:
+                Dhat_dict[c, k] = float(self._huplc_data[k][c])
+
+
+        model.add_component('fixed_Dhat', ConstraintList())
+        new_con = getattr(model, 'fixed_Dhat')
+
+        model.add_component('Dhat', Var(times, huplcabscompsnames,initialize=Dhat_dict))
+        Dhat = getattr(model, 'Dhat')
+        model.add_component('Chat', Var(timesh, huplcabscompsnames,initialize=1))
+
+        Chat = getattr(model, 'Chat')
+
+        model.add_component('matchChatZ', ConstraintList())
+        matchChatZ_con = getattr(model, 'matchChatZ')
